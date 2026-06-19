@@ -15,6 +15,13 @@ class MyApplication : Application() {
         instance = this
 
         NotificationUtils.createChannels(this)
+
+        // Log unhandled exceptions instead of crashing the process
+        val defaultHandler = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { t, e ->
+            Log.e(TAG, "Uncaught exception in thread ${t.name}: ${e.message}", e)
+            defaultHandler?.uncaughtException(t, e)
+        }
     }
 
     fun setBusy() = if (isBusy.compareAndSet(false, true)) {

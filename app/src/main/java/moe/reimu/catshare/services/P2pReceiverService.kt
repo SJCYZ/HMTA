@@ -13,6 +13,7 @@ import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.net.wifi.WifiManager
 import android.net.wifi.p2p.WifiP2pConfig
 import android.net.wifi.p2p.WifiP2pGroup
 import android.net.wifi.p2p.WifiP2pInfo
@@ -52,6 +53,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import moe.reimu.catshare.AppSettings
 import moe.reimu.catshare.BuildConfig
@@ -88,6 +90,7 @@ import moe.reimu.catshare.utils.ZipPathValidatorCallback
 
 class P2pReceiverService : BaseP2pService() {
     private lateinit var notificationManager: NotificationManagerCompat
+    private var wifiLock: WifiManager.WifiLock? = null
 
     private val internalReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -167,6 +170,13 @@ class P2pReceiverService : BaseP2pService() {
         val localTaskId = Random.nextInt()
         val job = CoroutineScope(Dispatchers.IO + SupervisorJob()).launch {
             try {
+                // Hold WiFi high-perf lock to prevent connection drop during transfer
+                val wm = getSystemService(Context.WIFI_SERVICE) as WifiManager
+                wifiLock = wm.createWifiLock(
+                    WifiManager.WIFI_MODE_FULL_HIGH_PERF, "CatShare:Recv"
+                )
+                wifiLock?.acquire()
+
                 startForeground(
                     NotificationUtils.RECEIVER_FG_ID,
                     createPrepareNotification(getString(R.string.noti_connecting)),
@@ -186,6 +196,8 @@ class P2pReceiverService : BaseP2pService() {
                     createFailedNotification(e)
                 )
             } finally {
+                try { wifiLock?.release() } catch (_: Throwable) {}
+                wifiLock = null
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 MyApplication.getInstance().clearBusy()
             }
@@ -389,6 +401,8 @@ class P2pReceiverService : BaseP2pService() {
                     sslContext.init(null, arrayOf(tm), SecureRandom())
 
                     connectTimeout(3, TimeUnit.SECONDS)
+                    readTimeout(0, TimeUnit.MILLISECONDS)
+                    writeTimeout(0, TimeUnit.MILLISECONDS)
                     connectionPool(
                         ConnectionPool(5, 10, TimeUnit.SECONDS)
                     )
@@ -442,17 +456,7 @@ class P2pReceiverService : BaseP2pService() {
                         null
                     }
 
-                    val thumbPath = sendRequestPayload.optString("thumbnail")
-                    val bigPicture = if (thumbPath.isNotEmpty()) {
-                        val thumbUrl = "https://${hostPort}$thumbPath"
-                        Log.d(TAG, "Fetching thumbnail from $thumbUrl")
-
-                        val body = client.get(thumbUrl).bodyAsBytes()
-                        BitmapFactory.decodeByteArray(body, 0, body.size)
-                    } else null
-
                     if (!AppSettings(this@P2pReceiverService).autoAccept) {
-                        // Ask user for confirmation
                         updateNotification(
                             createAskingNotification(
                                 localTaskId,
@@ -460,7 +464,7 @@ class P2pReceiverService : BaseP2pService() {
                                 fileName,
                                 fileCount,
                                 totalSize,
-                                bigPicture,
+                                null,
                                 textContent
                             )
                         )
@@ -483,9 +487,7 @@ class P2pReceiverService : BaseP2pService() {
                     if (textContent != null) {
                         val cm = getSystemService(ClipboardManager::class.java)
                         cm.setPrimaryClip(ClipData.newPlainText("Shared Text", textContent))
-
                         showTextCopiedToast()
-
                         wsSession.sendStatusIgnoreException(99, taskId, 1, "ok")
                         delay(1000)
                         return@async

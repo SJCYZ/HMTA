@@ -8,6 +8,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ServiceInfo
+import android.net.wifi.WifiManager
 import android.net.wifi.p2p.WifiP2pConfig
 import android.net.wifi.p2p.WifiP2pDevice
 import android.net.wifi.p2p.WifiP2pDeviceList
@@ -23,6 +24,7 @@ import androidx.core.app.NotificationManagerCompat
 import io.ktor.http.ContentType
 import io.ktor.http.HttpStatusCode
 import io.ktor.network.tls.certificates.buildKeyStore
+import io.netty.channel.ChannelOption
 import io.ktor.server.application.install
 import io.ktor.server.engine.embeddedServer
 import io.ktor.server.engine.sslConnector
@@ -45,6 +47,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.selects.select
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -98,6 +101,7 @@ class P2pSenderService : BaseP2pService() {
     private var curreentTaskId: Int? = null
 
     private lateinit var notificationManager: NotificationManagerCompat
+    private var wifiLock: WifiManager.WifiLock? = null
 
     private val internalReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -213,6 +217,15 @@ class P2pSenderService : BaseP2pService() {
             }
 
             enableHttp2 = false
+            responseWriteTimeoutSeconds = 86_400 // 24h for large file transfers
+
+            configureBootstrap = {
+                childOption(ChannelOption.TCP_NODELAY, true)
+                childOption(ChannelOption.SO_SNDBUF, 1024 * 1024)
+                childOption(ChannelOption.SO_RCVBUF, 1024 * 1024)
+                childOption(ChannelOption.WRITE_BUFFER_WATER_MARK,
+                    io.netty.channel.WriteBufferWaterMark(32 * 1024, 1024 * 1024))
+            }
         }) {
             install(WebSockets)
 
@@ -262,7 +275,7 @@ class P2pSenderService : BaseP2pService() {
                             }
                         } catch (e: Throwable) {
                             Log.e(TAG, "WebSocket failed", e)
-                            throw e
+                            // Do not re-throw to avoid cascading coroutine cancellation
                         } finally {
                             outgoing.close()
                         }
@@ -309,6 +322,24 @@ class P2pSenderService : BaseP2pService() {
                     var processedSize = 0L
                     var lastProgressUpdate = 0L
 
+                    fun updateProgress() {
+                        val now = System.nanoTime()
+                        val elapsed = TimeUnit.SECONDS.convert(
+                            now - lastProgressUpdate, TimeUnit.NANOSECONDS
+                        )
+                        if (elapsed > 1) {
+                            updateNotification(
+                                createProgressNotification(
+                                    task.id,
+                                    task.device.name,
+                                    totalSize,
+                                    processedSize
+                                )
+                            )
+                            lastProgressUpdate = now
+                        }
+                    }
+
                     call.respondOutputStream(ContentType.Application.Zip, HttpStatusCode.OK) {
                         val cr = contentResolver
                         ZipOutputStream(this).use { zo ->
@@ -326,28 +357,10 @@ class P2pSenderService : BaseP2pService() {
                                     val buffer = ByteArray(1024 * 1024 * 4)
                                     while (true) {
                                         val readLen = ist.read(buffer)
-                                        if (readLen == -1) {
-                                            break
-                                        }
+                                        if (readLen == -1) break
                                         zo.write(buffer, 0, readLen)
                                         processedSize += readLen.toLong()
-
-                                        // Update progress if needed
-                                        val now = System.nanoTime()
-                                        val elapsed = TimeUnit.SECONDS.convert(
-                                            now - lastProgressUpdate, TimeUnit.NANOSECONDS
-                                        )
-                                        if (elapsed > 1) {
-                                            updateNotification(
-                                                createProgressNotification(
-                                                    task.id,
-                                                    task.device.name,
-                                                    totalSize,
-                                                    processedSize
-                                                )
-                                            )
-                                            lastProgressUpdate = now
-                                        }
+                                        updateProgress()
                                     }
 
                                     zo.closeEntry()
@@ -376,7 +389,7 @@ class P2pSenderService : BaseP2pService() {
 
             val p2pConfig = WifiP2pConfig.Builder().setGroupOperatingBand(
                 if (task.device.supports5Ghz) {
-                    WifiP2pConfig.GROUP_OWNER_BAND_AUTO
+                    WifiP2pConfig.GROUP_OWNER_BAND_5GHZ
                 } else {
                     WifiP2pConfig.GROUP_OWNER_BAND_2GHZ
                 }
@@ -519,6 +532,13 @@ class P2pSenderService : BaseP2pService() {
         @Suppress("DEPRECATION") val task = intent.getParcelableExtra<TaskInfo>("task") ?: return START_NOT_STICKY
         val job = CoroutineScope(Dispatchers.IO + SupervisorJob()).launch {
             try {
+                // Hold WiFi high-perf lock to prevent connection drop during transfer
+                val wm = getSystemService(Context.WIFI_SERVICE) as WifiManager
+                wifiLock = wm.createWifiLock(
+                    WifiManager.WIFI_MODE_FULL_HIGH_PERF, "CatShare:Send"
+                )
+                wifiLock?.acquire()
+
                 startForeground(
                     NotificationUtils.SENDER_FG_ID,
                     createPendingNotification(task.id, task.device.name),
@@ -542,6 +562,8 @@ class P2pSenderService : BaseP2pService() {
                     createFailedNotification(task.device.name, e)
                 )
             } finally {
+                try { wifiLock?.release() } catch (_: Throwable) {}
+                wifiLock = null
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 MyApplication.getInstance().clearBusy()
                 synchronized(currentTaskLock) {
