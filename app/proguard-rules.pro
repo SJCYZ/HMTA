@@ -26,7 +26,7 @@
 -renamesourcefileattribute SourceFile
 -keepattributes Signature,InnerClasses
 
--keep class moe.reimu.catshare.** { *; }
+-keep class com.sjcyz.hmta.** { *; }
 
 -keep class io.netty.** { *; }
 -keep class io.ktor.** { *; }

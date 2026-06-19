@@ -1,0 +1,6 @@
+package com.sjcyz.hmta.exceptions
+
+import io.ktor.utils.io.CancellationException
+
+class CancelledByUserException(val isRemote: Boolean) :
+    CancellationException("Cancelled by user")

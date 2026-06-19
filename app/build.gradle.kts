@@ -9,11 +9,11 @@ plugins {
 }
 
 android {
-    namespace = "moe.reimu.catshare"
+    namespace = "com.sjcyz.hmta"
     compileSdk = 36
 
     defaultConfig {
-        applicationId = "moe.reimu.catshare"
+        applicationId = "com.sjcyz.hmta"
         minSdk = 29
         targetSdk = 36
         versionCode = 7
@@ -59,7 +59,7 @@ android {
         }
         debug {
             applicationIdSuffix = ".debug"
-            resValue("string", "app_name", "CatShare (Debug)")
+            resValue("string", "app_name", "HMTA (Debug)")
         }
     }
     compileOptions {
