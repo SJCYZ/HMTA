@@ -1,62 +1,41 @@
-# CatShare
-类原生 & 海外设备，现已加入互传联盟。
+# HMTA
 
-Android 目前已不再支持非系统应用获取手机的 MAC 地址等无法重置的序列号，但由于各品牌的互传功能通常为系统应用，互传联盟协议将设备的 MAC 地址作为其认证信息的一部分，目前暂时无法绕过。
-
-本 App 的 GitHub Release 和 F-Droid 版本签名一致， F-Droid 版本可能相对滞后，可以任意选择。
-
-[<img src="https://f-droid.org/badge/get-it-on-zh-cn.png"
-    alt="Get it on F-Droid"
-    height="80">](https://f-droid.org/packages/moe.reimu.catshare)
-[<img src="https://www.openapk.net/images/openapk-badge.png"
-    alt="Get it on OpenAPK"
-    height="80">](https://www.openapk.net/catshare/moe.reimu.catshare/)
-[<img src="https://www.androidfreeware.net/images/androidfreeware-badge.png"
-    alt="Get it on Android Freeware"
-    height="80">](https://www.androidfreeware.net/download-catshare-apk.html)
+基于 CatShare 的互传客户端，支持与 OPPO/一加等品牌互传联盟设备进行文件传输。
 
 ## 功能
 - [x] 蓝牙发现
 - [x] 文件接收
 - [x] 文件发送（需要 Shizuku 支持）
-- [x] 文本传输（两侧均为 CatShare 时复制至剪贴板，接收方为其他设备时以文本文件形式发送） 
+- [x] 双向大文件传输（5GHz Wi-Fi Direct + Wi-Fi 高性能锁）
+- [x] 悬浮窗设备选择
+- [x] 文本传输（复制至剪贴板）
+- [ ] NFC 一碰传
 
 ## 支持设备（已测试）
-| 品牌        | 向该设备发送 | 从该设备接收            |
-| ----------- | ------------ | ----------------------- |
-| 小米        | Y            | Y                       |
-| OPPO/一加等 | Y            | Y，但发送端提示接收失败 |
-| vivo        | Y            | Y                       |
+| 品牌        | 向该设备发送 | 从该设备接收 |
+| ----------- | ------------ | ------------ |
+| OPPO/一加等 | Y            | Y            |
+| 小米        | Y            | Y            |
+| vivo        | Y            | Y            |
 
 ## 汇报问题
 
-你可以在该项目的 issue 区汇报你在使用 CatShare 期间遇到的问题，尽量的，请附上 CatShare 的 adb logcat 日志。
+你可以在该项目的 issue 区汇报你在使用 HMTA 期间遇到的问题，尽量的，请附上 HMTA 的 adb logcat 日志。
 
-通过该命令获取 CatShare 的日志。
-<details>
-<summary>release(正式版)</summary>
-
-shell(linux)
-```shell
-adb logcat --pid $(adb shell pidof -s moe.reimu.catshare)
-```
-cmd(windows)
-```shell
-for /f "tokens=1" %i in ('adb shell pidof -s moe.reimu.catshare') do adb logcat --pid %i
-```
-</details>
+通过该命令获取 HMTA 的日志。
 <details>
 <summary>debug(测试版)</summary>
 
 shell(linux)
 ```shell
-adb logcat --pid $(adb shell pidof -s moe.reimu.catshare.debug)
+adb logcat --pid $(adb shell pidof -s com.sjcyz.hmta.debug)
 ```
 cmd(windows)
 ```shell
-for /f "tokens=1" %i in ('adb shell pidof -s moe.reimu.catshare.debug') do adb logcat --pid %i
+for /f "tokens=1" %i in ('adb shell pidof -s com.sjcyz.hmta.debug') do adb logcat --pid %i
 ```
 </details>
+
 建议尽可能完整的截取日志，并注释从什么时候发送或接收内容，尽量使用折叠块语法来包裹日志内容。
 
 ````markdown
