@@ -6,7 +6,11 @@ import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.os.IBinder
 import android.util.Log
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import com.sjcyz.hmta.BuildConfig
 import com.sjcyz.hmta.IMacAddressService
 import com.sjcyz.hmta.services.MacAddressService
@@ -16,8 +20,8 @@ import kotlin.collections.iterator
 
 object ShizukuUtils {
     private val binderLock = Object()
-    private val serviceNotify = Object()
     private var macService: IMacAddressService? = null
+    private var serviceDeferred = CompletableDeferred<IMacAddressService?>()
 
     init {
         Shizuku.addBinderReceivedListenerSticky {
@@ -32,10 +36,7 @@ object ShizukuUtils {
 
                 synchronized(binderLock) {
                     macService = IMacAddressService.Stub.asInterface(service)
-                }
-
-                synchronized(serviceNotify) {
-                    serviceNotify.notifyAll()
+                    serviceDeferred.complete(macService)
                 }
             }
         }
@@ -44,6 +45,7 @@ object ShizukuUtils {
             Log.d(ShizukuUtils.TAG, "Connection lost for $name")
             synchronized(binderLock) {
                 macService = null
+                serviceDeferred = CompletableDeferred()
             }
         }
     }
@@ -68,36 +70,10 @@ object ShizukuUtils {
         }
     }
 
-    fun unsafeGetMacAddress(name: String): String? {
-        synchronized(binderLock) {
-            val svc = macService
-            if (svc == null) {
-                Log.d(TAG, "MAC service is null, trying to bind")
-                unsafeBindService()
-            } else {
-                return svc.getMacAddressByName(name)
-            }
-        }
-
-        synchronized(serviceNotify) {
-            serviceNotify.wait(1000 * 20)
-        }
-
-        synchronized(binderLock) {
-            return macService?.p2pMacAddress
-        }
-    }
-
     fun getMacAddress(context: Context, name: String, l: (String?) -> Unit) {
-        if (context.checkSelfPermission("android.permission.LOCAL_MAC_ADDRESS") == PackageManager.PERMISSION_GRANTED) {
-            Log.d(TAG, "Permission granted, using native method")
-            l(nativeGetMacAddressByName(name))
-            return
-        }
-
-        val th = Thread {
+        CoroutineScope(Dispatchers.IO).launch {
             val res = try {
-                unsafeGetMacAddress(name)
+                suspendGetMacAddress(context, name)
             } catch (e: Throwable) {
                 Log.e(ShizukuUtils.TAG, "Failed to obtain MAC address for $name", e)
                 null
@@ -105,7 +81,6 @@ object ShizukuUtils {
 
             l(res)
         }
-        th.start()
     }
 
     @OptIn(ExperimentalStdlibApi::class)
@@ -122,10 +97,30 @@ object ShizukuUtils {
     }
 
     suspend fun getMacAddress(context: Context, name: String): String? {
-        val fut = CompletableDeferred<String?>()
-        getMacAddress(context, name) {
-            fut.complete(it)
+        return suspendGetMacAddress(context, name)
+    }
+
+    private suspend fun suspendGetMacAddress(context: Context, name: String): String? {
+        if (context.checkSelfPermission("android.permission.LOCAL_MAC_ADDRESS") == PackageManager.PERMISSION_GRANTED) {
+            Log.d(TAG, "Permission granted, using native method")
+            return nativeGetMacAddressByName(name)
         }
-        return fut.await()
+
+        synchronized(binderLock) {
+            macService?.let { return it.getMacAddressByName(name) }
+        }
+
+        try {
+            unsafeBindService()
+        } catch (e: Throwable) {
+            Log.e(TAG, "Failed to bind service", e)
+            return null
+        }
+
+        val deferred = serviceDeferred
+        val svc = withTimeoutOrNull(20_000) {
+            deferred.await()
+        }
+        return svc?.getMacAddressByName(name)
     }
 }

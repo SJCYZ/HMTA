@@ -9,14 +9,18 @@ import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.ComponentName
 import android.content.Context
+import android.content.BroadcastReceiver
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.ServiceConnection
 import android.net.Uri
 import android.net.wifi.WifiManager
+import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
 import android.os.ParcelUuid
 import android.provider.MediaStore
+import android.text.format.Formatter
 import android.util.Log
 import android.widget.Toast
 import androidx.core.content.FileProvider
@@ -33,9 +37,11 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
@@ -44,12 +50,16 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AccountCircle
 import androidx.compose.material3.Card
+import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -75,8 +85,15 @@ import com.sjcyz.hmta.utils.TAG
 import java.nio.ByteBuffer
 import kotlin.random.Random
 
+private data class SendingState(
+    val taskId: Int,
+    val deviceName: String,
+    val progress: Pair<Long, Long>? = null,
+)
+
 class ShareActivity : ComponentActivity() {
     private lateinit var bluetoothManager: BluetoothManager
+    private val fileInfosState = mutableStateOf<List<FileInfo>?>(null)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -96,6 +113,45 @@ class ShareActivity : ComponentActivity() {
             return
         }
 
+        val fileInfos = resolveFileInfos(intent)
+        if (fileInfos == null) {
+            finish()
+            return
+        }
+        fileInfosState.value = fileInfos
+
+        Log.i(TAG, "Shared ${fileInfos.size} files")
+
+        ShizukuUtils.bindService()
+
+        enableEdgeToEdge()
+        setContent {
+            HmtaTheme {
+                val files = fileInfosState.value
+                if (files != null) {
+                    // key() resets the sending/scan state when a new set of
+                    // files arrives via onNewIntent (singleTask relaunch).
+                    key(files) {
+                        ShareActivityContent(files)
+                    }
+                }
+            }
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        val fileInfos = resolveFileInfos(intent)
+        if (fileInfos == null) {
+            finish()
+            return
+        }
+        fileInfosState.value = fileInfos
+        Log.i(TAG, "New share request: ${fileInfos.size} files")
+    }
+
+    private fun resolveFileInfos(intent: Intent): List<FileInfo>? {
         val fileInfos = try {
             if (intent.action == Intent.ACTION_SEND) {
                 @Suppress("DEPRECATION") val uri = intent.getParcelableExtra<Uri>(Intent.EXTRA_STREAM)
@@ -115,69 +171,139 @@ class ShareActivity : ComponentActivity() {
             }
         } catch (e: Throwable) {
             Log.e("ShareActivity", "Failed to extract file info", e)
+            null
+        }
+
+        if (fileInfos.isNullOrEmpty()) {
             Toast.makeText(this, R.string.no_file_shared, Toast.LENGTH_SHORT).show()
-            finish()
-            return
+            return null
         }
-
-        if (fileInfos.isEmpty()) {
-            Toast.makeText(this, R.string.no_file_shared, Toast.LENGTH_SHORT).show()
-            finish()
-            return
-        }
-
-        Log.i(TAG, "Shared ${fileInfos.size} files")
-
-        ShizukuUtils.bindService()
-
-        val hasStoragePerm = if (android.os.Build.VERSION.SDK_INT >= 30) {
-            android.os.Environment.isExternalStorageManager()
-        } else {
-            checkSelfPermission(android.Manifest.permission.READ_EXTERNAL_STORAGE) == android.content.pm.PackageManager.PERMISSION_GRANTED
-        }
-
-        enableEdgeToEdge()
-        setContent {
-            HmtaTheme {
-                ShareActivityContent(fileInfos, hasStoragePerm)
-            }
-        }
+        return fileInfos
     }
 
     private fun extractFileInfo(uri: Uri): FileInfo? {
         val cr = contentResolver
-        val proj = arrayOf(
-            MediaStore.MediaColumns.DISPLAY_NAME,
-            MediaStore.MediaColumns.MIME_TYPE,
-            MediaStore.MediaColumns.SIZE
-        )
-        return cr.query(uri, proj, null, null)?.use {
-            if (it.moveToFirst()) {
-                val mimeIndex = it.getColumnIndex(MediaStore.MediaColumns.MIME_TYPE)
-                FileInfo(
-                    uri,
-                    it.getString(it.getColumnIndexOrThrow(MediaStore.MediaColumns.DISPLAY_NAME)),
-                    if (mimeIndex < 0) {
-                        "application/octet-stream"
-                    } else {
-                        it.getString(mimeIndex)
-                    },
-                    it.getLong(it.getColumnIndexOrThrow(MediaStore.MediaColumns.SIZE)),
-                    null
-                )
-            } else {
-                null
+        var name: String? = null
+        var mime: String? = null
+        var size: Long? = null
+
+        try {
+            val proj = arrayOf(
+                MediaStore.MediaColumns.DISPLAY_NAME,
+                MediaStore.MediaColumns.MIME_TYPE,
+                MediaStore.MediaColumns.SIZE
+            )
+            cr.query(uri, proj, null, null)?.use { c ->
+                if (c.moveToFirst()) {
+                    val nameIdx = c.getColumnIndex(MediaStore.MediaColumns.DISPLAY_NAME)
+                    if (nameIdx >= 0 && !c.isNull(nameIdx)) name = c.getString(nameIdx)
+                    val mimeIdx = c.getColumnIndex(MediaStore.MediaColumns.MIME_TYPE)
+                    if (mimeIdx >= 0 && !c.isNull(mimeIdx)) mime = c.getString(mimeIdx)
+                    val sizeIdx = c.getColumnIndex(MediaStore.MediaColumns.SIZE)
+                    if (sizeIdx >= 0 && !c.isNull(sizeIdx)) size = c.getLong(sizeIdx)
+                }
+            }
+        } catch (e: Throwable) {
+            Log.w(TAG, "Failed to query file info for $uri", e)
+        }
+
+        // Some providers do not expose SIZE; fall back to the asset file descriptor.
+        if (size == null || size!! <= 0) {
+            try {
+                cr.openAssetFileDescriptor(uri, "r")?.use { afd ->
+                    val len = afd.length
+                    if (len > 0) size = len
+                }
+            } catch (e: Throwable) {
+                Log.w(TAG, "Failed to open asset fd for $uri", e)
             }
         }
+
+        // Last resort: some providers report an unknown length. Read the stream
+        // once to determine the real size so the peer never sees totalSize=0/-1.
+        if (size == null || size!! <= 0) {
+            try {
+                cr.openInputStream(uri)?.use { input ->
+                    val buf = ByteArray(64 * 1024)
+                    var total = 0L
+                    while (true) {
+                        val n = input.read(buf)
+                        if (n < 0) break
+                        total += n
+                    }
+                    if (total > 0) size = total
+                }
+            } catch (e: Throwable) {
+                Log.w(TAG, "Failed to read stream size for $uri", e)
+            }
+        }
+
+        // Fallback file name from the URI when the provider has no DISPLAY_NAME.
+        if (name.isNullOrEmpty()) {
+            val last = uri.lastPathSegment ?: ""
+            val q = last.indexOf('?')
+            name = if (q >= 0) last.substring(0, q) else last
+        }
+
+        if (mime.isNullOrEmpty()) {
+            mime = cr.getType(uri) ?: "application/octet-stream"
+        }
+
+        if (name.isNullOrEmpty()) return null
+        return FileInfo(uri, name, mime ?: "application/octet-stream", size ?: -1, null)
     }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ShareActivityContent(files: List<FileInfo>, hasStoragePerm: Boolean) {
+fun ShareActivityContent(files: List<FileInfo>) {
     val context = LocalContext.current
     val activity = LocalActivity.current
     val discoveredDevices = deviceScanner()
+    var sending by remember { mutableStateOf<SendingState?>(null) }
+
+    // Keep this page (and therefore the share URI grant) alive until the
+    // transfer finishes; some providers revoke the temporary grant as soon
+    // as this activity is destroyed.
+    DisposableEffect(activity) {
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context, intent: Intent) {
+                when (intent.action) {
+                    P2pSenderService.ACTION_SEND_FINISHED -> {
+                        val taskId = intent.getIntExtra("taskId", -1)
+                        if (sending?.taskId == taskId) {
+                            activity?.finish()
+                        }
+                    }
+
+                    P2pSenderService.ACTION_SEND_PROGRESS -> {
+                        val taskId = intent.getIntExtra("taskId", -1)
+                        val current = sending
+                        if (current?.taskId == taskId) {
+                            sending = current.copy(
+                                progress = Pair(
+                                    intent.getLongExtra("processed", 0L),
+                                    intent.getLongExtra("total", 0L)
+                                )
+                            )
+                        }
+                    }
+                }
+            }
+        }
+        val filter = IntentFilter().apply {
+            addAction(P2pSenderService.ACTION_SEND_FINISHED)
+            addAction(P2pSenderService.ACTION_SEND_PROGRESS)
+        }
+        if (Build.VERSION.SDK_INT >= 33) {
+            context.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("DEPRECATION") context.registerReceiver(receiver, filter)
+        }
+        onDispose {
+            context.unregisterReceiver(receiver)
+        }
+    }
 
     val iconMod = Modifier.size(48.dp).padding(end = 16.dp)
 
@@ -194,46 +320,102 @@ fun ShareActivityContent(files: List<FileInfo>, hasStoragePerm: Boolean) {
             shape = MaterialTheme.shapes.extraLarge
         ) {
             Column(modifier = Modifier.fillMaxSize()) {
-                // Title bar
-                Row(
-                    modifier = Modifier.fillMaxWidth().padding(16.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        text = stringResource(R.string.choose_recipient),
-                        style = MaterialTheme.typography.titleMedium,
-                        modifier = Modifier.weight(1f)
-                    )
-                }
+                val currentSending = sending
+                if (currentSending == null) {
+                    // Title bar
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(16.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = stringResource(R.string.choose_recipient),
+                            style = MaterialTheme.typography.titleMedium,
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
 
-                // Device list
-                val listState = rememberLazyListState()
-                LazyColumn(
-                    state = listState,
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
-                    contentPadding = PaddingValues(horizontal = 16.dp),
-                    modifier = Modifier.weight(1f)
-                ) {
-                    if (discoveredDevices.isEmpty()) {
-                        item { Text(stringResource(R.string.scanning_desc)) }
-                    } else {
-                        items(discoveredDevices, key = { it.id }) {
-                            DefaultCard(onClick = {
-                                val task = TaskInfo(id = Random.nextInt(), device = it, files = files)
-                                P2pSenderService.startTaskChecked(context, task)
-                                if (hasStoragePerm) activity?.finish()
-                            }) {
-                                Row(modifier = Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
-                                    Icon(Icons.Filled.AccountCircle, null, modifier = iconMod)
-                                    Column {
-                                        Text(
-                                            text = if (BuildConfig.DEBUG) "${it.name} (${it.id}, ${it.device.address})" else it.name,
-                                            style = MaterialTheme.typography.titleMedium
-                                        )
-                                        Text(text = it.brand ?: stringResource(R.string.unknown))
+                    // Device list
+                    val listState = rememberLazyListState()
+                    LazyColumn(
+                        state = listState,
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                        contentPadding = PaddingValues(horizontal = 16.dp),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        if (discoveredDevices.isEmpty()) {
+                            item { Text(stringResource(R.string.scanning_desc)) }
+                        } else {
+                            items(discoveredDevices, key = { it.id }) {
+                                DefaultCard(onClick = {
+                                    val task = TaskInfo(
+                                        id = Random.nextInt(), device = it, files = files
+                                    )
+                                    if (P2pSenderService.startTaskChecked(context, task)) {
+                                        sending = SendingState(task.id, it.name)
+                                    }
+                                }) {
+                                    Row(
+                                        modifier = Modifier.padding(16.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Icon(Icons.Filled.AccountCircle, null, modifier = iconMod)
+                                        Column {
+                                            Text(
+                                                text = if (BuildConfig.DEBUG) {
+                                                    "${it.name} (${it.id}, ${it.device.address})"
+                                                } else {
+                                                    it.name
+                                                },
+                                                style = MaterialTheme.typography.titleMedium
+                                            )
+                                            Text(text = it.brand ?: stringResource(R.string.unknown))
+                                        }
                                     }
                                 }
                             }
+                        }
+                    }
+                } else {
+                    // Sending in progress: keep this page visible so the shared
+                    // URI grants stay valid until the transfer completes.
+                    Column(
+                        modifier = Modifier.fillMaxSize().padding(24.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.Center
+                    ) {
+                        Text(
+                            text = stringResource(R.string.sending),
+                            style = MaterialTheme.typography.titleMedium
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(text = currentSending.deviceName)
+                        currentSending.progress?.let { p ->
+                            Spacer(modifier = Modifier.height(16.dp))
+                            val fraction = if (p.second > 0) {
+                                p.first.toFloat() / p.second.toFloat()
+                            } else {
+                                0f
+                            }
+                            LinearProgressIndicator(
+                                progress = { fraction },
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Text(
+                                text = "${Formatter.formatShortFileSize(context, p.first)} / ${
+                                    Formatter.formatShortFileSize(context, p.second)
+                                }"
+                            )
+                        }
+                        Spacer(modifier = Modifier.height(24.dp))
+                        Button(onClick = {
+                            context.sendBroadcast(
+                                Intent(P2pSenderService.ACTION_CANCEL_SENDING)
+                                    .putExtra("taskId", currentSending.taskId)
+                            )
+                            activity?.finish()
+                        }) {
+                            Text(text = stringResource(R.string.cancel_receive))
                         }
                     }
                 }
@@ -255,7 +437,7 @@ fun deviceScanner(): List<DiscoveredDevice> {
 
         val callback = object : ScanCallback() {
             override fun onScanFailed(errorCode: Int) {
-                println()
+                Log.w(TAG, "BLE scan failed: $errorCode")
             }
 
             override fun onScanResult(callbackType: Int, result: ScanResult) {

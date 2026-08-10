@@ -15,6 +15,7 @@ object NotificationUtils {
     const val GATT_SERVER_FG_ID = 1
     const val RECEIVER_FG_ID = 2
     const val SENDER_FG_ID = 3
+    const val RECEIVE_CONFIRM_NOTIFICATION_ID = 100
 
     fun createChannels(context: Context) {
         val manager = NotificationManagerCompat.from(context)

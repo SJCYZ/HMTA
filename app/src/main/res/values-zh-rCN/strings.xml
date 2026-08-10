@@ -68,4 +68,9 @@
     <string name="select_all">全选</string>
     <string name="close">关闭</string>
     <string name="text_copied">文本已复制至剪贴板</string>
+    <string name="recv_connecting">正在接收文件</string>
+    <string name="recv_connecting_desc">连接建立期间请保持此界面打开</string>
+    <string name="cancel_receive">取消</string>
+    <string name="receive_request_title">收到文件传输请求</string>
+    <string name="noti_receive_request_desc">有设备想向您发送文件。\n点击此通知打开接收窗口，或使用下方按钮处理。</string>
 </resources>

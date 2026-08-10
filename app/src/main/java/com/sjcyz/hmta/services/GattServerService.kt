@@ -2,9 +2,9 @@ package com.sjcyz.hmta.services
 
 
 import android.annotation.SuppressLint
-import android.app.ForegroundServiceStartNotAllowedException
 import android.app.Notification
 import android.app.PendingIntent
+import android.app.ForegroundServiceStartNotAllowedException
 import android.app.Service
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothGattCharacteristic
@@ -27,9 +27,11 @@ import android.os.IBinder
 import android.os.ParcelUuid
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import com.sjcyz.hmta.AppSettings
+import com.sjcyz.hmta.ReceiveConfirmActivity
 import com.sjcyz.hmta.BleSecurity
 import com.sjcyz.hmta.BuildConfig
 import com.sjcyz.hmta.R
@@ -171,7 +173,68 @@ class GattServerService : Service() {
                     catShare = BuildConfig.VERSION_CODE,
                 )
             }
-            startForegroundService(P2pReceiverService.getIntent(this@GattServerService, p2pInfo))
+            // Bring the app to the foreground while receiving: some ROMs (EMUI)
+            // reject WifiP2p operations without a visible activity.
+            val confirmIntent = Intent(this@GattServerService, ReceiveConfirmActivity::class.java)
+                .putExtra("p2p_info", p2pInfo)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            startActivity(confirmIntent)
+            // Full-screen notification as a second path to bring the confirm page up:
+            // EMUI/HarmonyOS blocks background Activity starts, so the system
+            // renders the full-screen intent instead of silently dropping it.
+            showReceiveConfirmNotification(p2pInfo)
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun showReceiveConfirmNotification(p2pInfo: P2pInfo) {
+        val confirmIntent = Intent(this, ReceiveConfirmActivity::class.java)
+            .putExtra("p2p_info", p2pInfo)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        val fullScreenPi = PendingIntent.getActivity(
+            this,
+            0x484D, // "HM"
+            confirmIntent,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+        val rejectPi = PendingIntent.getActivity(
+            this,
+            0x5245, // "RE"
+            Intent(this, ReceiveConfirmActivity::class.java).apply {
+                putExtra("action", P2pReceiverService.ACTION_REJECT)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            },
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+
+        val notification = NotificationCompat.Builder(this, NotificationUtils.RECEIVER_FG_CHAN_ID)
+            .setSmallIcon(R.drawable.ic_downloading)
+            .setContentTitle(getString(R.string.receive_request_title))
+            .setContentText(getString(R.string.recv_connecting_desc))
+            .setStyle(
+                NotificationCompat.BigTextStyle().bigText(
+                    getString(R.string.noti_receive_request_desc)
+                )
+            )
+            .setContentIntent(fullScreenPi)
+            .setPriority(NotificationCompat.PRIORITY_MAX)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .addAction(
+                R.drawable.ic_close,
+                getString(R.string.reject),
+                rejectPi
+            )
+            .setFullScreenIntent(fullScreenPi, true)
+            .setAutoCancel(true)
+            .build()
+
+        try {
+            NotificationManagerCompat.from(this).notify(
+                NotificationUtils.RECEIVE_CONFIRM_NOTIFICATION_ID,
+                notification
+            )
+        } catch (e: SecurityException) {
+            Log.w(TAG, "Failed to post full-screen receive notification", e)
         }
     }
 

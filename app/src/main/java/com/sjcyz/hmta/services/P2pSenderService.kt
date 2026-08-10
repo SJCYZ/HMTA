@@ -79,8 +79,10 @@ import no.nordicsemi.android.kotlin.ble.core.RealServerDevice
 import no.nordicsemi.android.kotlin.ble.core.data.util.DataByteArray
 import org.json.JSONObject
 import java.time.Duration
+import java.security.KeyStore
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
+import java.util.zip.Deflater
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 import kotlin.random.Random
@@ -98,7 +100,7 @@ class P2pSenderService : BaseP2pService() {
 
     private val currentTaskLock = Object()
     private var currentJob: Job? = null
-    private var curreentTaskId: Int? = null
+    private var currentTaskId: Int? = null
 
     private lateinit var notificationManager: NotificationManagerCompat
     private var wifiLock: WifiManager.WifiLock? = null
@@ -202,14 +204,7 @@ class P2pSenderService : BaseP2pService() {
         val wsCloseFuture = CompletableDeferred<Unit>()
 
         val httpServer = embeddedServer(Netty, configure = {
-            val keyStore = buildKeyStore {
-                certificate("sampleAlias") {
-                    password = "foobar"
-                    domains = listOf("127.0.0.1", "0.0.0.0", "localhost")
-                }
-            }
-
-            sslConnector(keyStore = keyStore,
+            sslConnector(keyStore = cachedKeyStore,
                 keyAlias = "sampleAlias",
                 keyStorePassword = { "123456".toCharArray() },
                 privateKeyPassword = { "foobar".toCharArray() }) {
@@ -319,6 +314,14 @@ class P2pSenderService : BaseP2pService() {
                         return@get
                     }
 
+                    Log.i(
+                        TAG,
+                        "Serving download for task $taskIdStr, files=${task.files.size}, totalSize=$totalSize"
+                    )
+                    task.files.forEach {
+                        Log.i(TAG, "  file: ${it.name}, uri=${it.uri}, size=${it.size}")
+                    }
+
                     var processedSize = 0L
                     var lastProgressUpdate = 0L
 
@@ -336,38 +339,60 @@ class P2pSenderService : BaseP2pService() {
                                     processedSize
                                 )
                             )
+                            sendBroadcast(
+                                Intent(ACTION_SEND_PROGRESS)
+                                    .setPackage(packageName)
+                                    .putExtra("taskId", task.id)
+                                    .putExtra("processed", processedSize)
+                                    .putExtra("total", totalSize)
+                            )
                             lastProgressUpdate = now
                         }
                     }
 
                     call.respondOutputStream(ContentType.Application.Zip, HttpStatusCode.OK) {
-                        val cr = contentResolver
-                        ZipOutputStream(this).use { zo ->
-                            if (sharedTextContent != null) {
-                                zo.putNextEntry(ZipEntry("0/sharedText.txt"))
-                                zo.write(sharedTextContent.toByteArray(Charsets.UTF_8))
-                                zo.closeEntry()
-                                return@use
-                            }
-
-                            for ((i, rf) in task.files.withIndex()) {
-                                cr.openInputStream(rf.uri)!!.use { ist ->
-                                    zo.putNextEntry(ZipEntry("$i/${rf.name}"))
-
-                                    val buffer = ByteArray(1024 * 1024 * 4)
-                                    while (true) {
-                                        val readLen = ist.read(buffer)
-                                        if (readLen == -1) break
-                                        zo.write(buffer, 0, readLen)
-                                        processedSize += readLen.toLong()
-                                        updateProgress()
-                                    }
-
+                        try {
+                            val cr = contentResolver
+                            ZipOutputStream(this).use { zo ->
+                                if (sharedTextContent != null) {
+                                    zo.putNextEntry(ZipEntry("0/sharedText.txt"))
+                                    zo.write(sharedTextContent.toByteArray(Charsets.UTF_8))
                                     zo.closeEntry()
+                                    return@use
+                                }
+
+                                for ((i, rf) in task.files.withIndex()) {
+                                    Log.i(TAG, "Opening input stream for ${rf.name} (${rf.uri})")
+                                    cr.openInputStream(rf.uri)!!.use { input ->
+                                        zo.setLevel(
+                                            if (isAlreadyCompressed(rf.mimeType)) {
+                                                Deflater.NO_COMPRESSION
+                                            } else {
+                                                Deflater.DEFAULT_COMPRESSION
+                                            }
+                                        )
+                                        zo.putNextEntry(ZipEntry("$i/${rf.name}"))
+
+                                        val buffer = ByteArray(1024 * 1024 * 4)
+                                        while (true) {
+                                            val readLen = input.read(buffer)
+                                            if (readLen == -1) break
+                                            zo.write(buffer, 0, readLen)
+                                            processedSize += readLen.toLong()
+                                            updateProgress()
+                                        }
+
+                                        zo.closeEntry()
+                                    }
                                 }
                             }
+                            Log.i(TAG, "Download stream finished for task $taskIdStr")
+                            transferCompleteFuture.complete(Unit)
+                        } catch (e: Throwable) {
+                            Log.e(TAG, "Download stream failed for task $taskIdStr", e)
+                            transferCompleteFuture.completeExceptionally(e)
+                            throw e
                         }
-                        transferCompleteFuture.complete(Unit)
                     }
                 }
             }
@@ -387,79 +412,140 @@ class P2pSenderService : BaseP2pService() {
             val ssid = "DIRECT-${DeviceUtils.getRandomChars(8)}"
             val psk = DeviceUtils.getRandomChars(8)
 
-            val p2pConfig = WifiP2pConfig.Builder().setGroupOperatingBand(
-                if (task.device.supports5Ghz) {
-                    WifiP2pConfig.GROUP_OWNER_BAND_5GHZ
-                } else {
-                    WifiP2pConfig.GROUP_OWNER_BAND_2GHZ
-                }
-            ).setNetworkName(ssid).setPassphrase(psk).enablePersistentMode(false).build()
+            val initialBand = if (task.device.supports5Ghz) {
+                WifiP2pConfig.GROUP_OWNER_BAND_5GHZ
+            } else {
+                WifiP2pConfig.GROUP_OWNER_BAND_2GHZ
+            }
+            var p2pConfig = WifiP2pConfig.Builder().setGroupOperatingBand(initialBand)
+                .setNetworkName(ssid).setPassphrase(psk).enablePersistentMode(false).build()
 
             try {
                 groupInfoFuture = CompletableDeferred()
                 p2pManager.createGroupSuspend(p2pChannel, p2pConfig)
-                groupInfoFuture.awaitWithTimeout(
-                    Duration.ofSeconds(5),
-                    "Waiting for P2P group info",
-                    R.string.error_p2p_failed
-                )
+                try {
+                    groupInfoFuture.awaitWithTimeout(
+                        Duration.ofSeconds(5),
+                        "Waiting for P2P group info",
+                        R.string.error_p2p_failed
+                    )
+                } catch (e: Throwable) {
+                    if (initialBand != WifiP2pConfig.GROUP_OWNER_BAND_5GHZ) {
+                        throw e
+                    }
+                    // 5GHz group creation failed; fall back to 2.4GHz once.
+                    Log.w(TAG, "5GHz group creation failed, retrying on 2.4GHz", e)
+                    try {
+                        p2pManager.removeGroupSuspend(p2pChannel)
+                    } catch (_: Throwable) {
+                    }
+                    p2pConfig = WifiP2pConfig.Builder().setGroupOperatingBand(
+                        WifiP2pConfig.GROUP_OWNER_BAND_2GHZ
+                    ).setNetworkName(ssid).setPassphrase(psk).enablePersistentMode(false).build()
+                    groupInfoFuture = CompletableDeferred()
+                    p2pManager.createGroupSuspend(p2pChannel, p2pConfig)
+                    groupInfoFuture.awaitWithTimeout(
+                        Duration.ofSeconds(5),
+                        "Waiting for P2P group info",
+                        R.string.error_p2p_failed
+                    )
+                }
 
                 val p2pMac = ShizukuUtils.getMacAddress(this@P2pSenderService, "p2p0") ?: "02:00:00:00:00:00"
                 Log.d(TAG, "Advertised local MAC address: $p2pMac")
 
-                withTimeoutReason(
-                    Duration.ofSeconds(10),
-                    "BLE operations",
-                    R.string.error_bt_failed
-                ) {
-                    var gBleClient: ClientBleGatt? = null
+                var bleSucceeded = false
+                var bleError: Throwable? = null
+                for (attempt in 1..3) {
                     try {
-                        val bleClient = ClientBleGatt.connect(
-                            this@P2pSenderService,
-                            RealServerDevice(task.device.device),
-                            this@withTimeoutReason,
-                        )
-                        gBleClient = bleClient
+                        withTimeoutReason(
+                            Duration.ofSeconds(10),
+                            "BLE operations",
+                            R.string.error_bt_failed
+                        ) {
+                            var gBleClient: ClientBleGatt? = null
+                            try {
+                                val bleClient = ClientBleGatt.connect(
+                                    this@P2pSenderService,
+                                    RealServerDevice(task.device.device),
+                                    this@withTimeoutReason,
+                                )
+                                gBleClient = bleClient
 
-                        bleClient.requestMtu(512)
-                        val services = bleClient.discoverServices()
-                        val p2pService = services.findService(BleUtils.SERVICE_UUID)
-                            ?: throw IllegalStateException("BLE service not found")
-                        val deviceInfoChar =
-                            p2pService.findCharacteristic(BleUtils.CHAR_STATUS_UUID)
-                                ?: throw IllegalStateException("BLE device info char not found")
-                        val p2pInfoChar = p2pService.findCharacteristic(BleUtils.CHAR_P2P_UUID)
-                            ?: throw IllegalStateException("BLE P2P info char not found")
-                        val rdInfo: DeviceInfo =
-                            JsonWithUnknownKeys.decodeFromString(deviceInfoChar.read().value.decodeToString())
-                        Log.i(TAG, "Remote device: $rdInfo")
+                                // MTU is optional; some peers do not answer the request
+                                // after a previous session, which would stall the whole handshake.
+                                try {
+                                    withTimeoutOrNull(3000L) {
+                                        bleClient.requestMtu(512)
+                                    } ?: Log.w(TAG, "MTU negotiation timed out, continuing with default")
+                                } catch (e: Throwable) {
+                                    Log.w(TAG, "MTU negotiation failed, continuing", e)
+                                }
+                                val services = bleClient.discoverServices()
+                                val p2pService = services.findService(BleUtils.SERVICE_UUID)
+                                    ?: throw IllegalStateException("BLE service not found")
+                                val deviceInfoChar =
+                                    p2pService.findCharacteristic(BleUtils.CHAR_STATUS_UUID)
+                                        ?: throw IllegalStateException("BLE device info char not found")
+                                val p2pInfoChar = p2pService.findCharacteristic(BleUtils.CHAR_P2P_UUID)
+                                    ?: throw IllegalStateException("BLE P2P info char not found")
+                                val rdInfo: DeviceInfo =
+                                    JsonWithUnknownKeys.decodeFromString(deviceInfoChar.read().value.decodeToString())
+                                Log.i(TAG, "Remote device: $rdInfo")
 
-                        val cipher = rdInfo.key?.let {
-                            BleSecurity.deriveSessionKey(it)
+                                val cipher = rdInfo.key?.let {
+                                    BleSecurity.deriveSessionKey(it)
+                                }
+
+                                val newP2pInfo = P2pInfo(
+                                    id = BleUtils.getSenderId(),
+                                    ssid = cipher?.encrypt(ssid) ?: ssid,
+                                    psk = cipher?.encrypt(psk) ?: psk,
+                                    mac = cipher?.encrypt(p2pMac) ?: p2pMac,
+                                    key = if (cipher != null) {
+                                        BleSecurity.getEncodedPublicKey()
+                                    } else {
+                                        null
+                                    },
+                                    port = serverPort,
+                                    catShare = BuildConfig.VERSION_CODE,
+                                )
+
+                                p2pInfoChar.write(
+                                    DataByteArray(
+                                        Json.encodeToString(newP2pInfo).toByteArray()
+                                    )
+                                )
+                            } finally {
+                                // Explicitly disconnect before closing: some peers
+                                // (e.g. OPPO/OnePlus system share) keep their GATT
+                                // server occupied if they only see close(), which
+                                // makes the next send fail during service discovery.
+                                try {
+                                    if (gBleClient?.isConnected == true) {
+                                        gBleClient?.disconnect()
+                                        delay(300)
+                                    }
+                                } catch (e: Throwable) {
+                                    Log.w(TAG, "BLE disconnect failed", e)
+                                }
+                                gBleClient?.close()
+                            }
                         }
-
-                        val newP2pInfo = P2pInfo(
-                            id = BleUtils.getSenderId(),
-                            ssid = cipher?.encrypt(ssid) ?: ssid,
-                            psk = cipher?.encrypt(psk) ?: psk,
-                            mac = cipher?.encrypt(p2pMac) ?: p2pMac,
-                            key = if (cipher != null) {
-                                BleSecurity.getEncodedPublicKey()
-                            } else {
-                                null
-                            },
-                            port = serverPort,
-                            catShare = BuildConfig.VERSION_CODE,
-                        )
-
-                        p2pInfoChar.write(
-                            DataByteArray(
-                                Json.encodeToString(newP2pInfo).toByteArray()
-                            )
-                        )
-                    } finally {
-                        gBleClient?.close()
+                        bleSucceeded = true
+                        break
+                    } catch (e: Throwable) {
+                        bleError = e
+                        Log.w(TAG, "BLE handshake attempt $attempt failed", e)
+                        if (attempt < 3) {
+                            delay(2000)
+                        }
                     }
+                }
+                if (!bleSucceeded) {
+                    throw bleError ?: ExceptionWithMessage(
+                        "Failed BLE operations", RuntimeException("BLE handshake failed"), R.string.error_bt_failed
+                    )
                 }
 
                 val transferJob = async {
@@ -493,6 +579,29 @@ class P2pSenderService : BaseP2pService() {
                         throw CancelledByUserException(true)
                     }
                     if (status.first == 1) {
+                        if (sharedTextContent == null) {
+                            // The peer may report success before it has actually
+                            // consumed the stream (observed with OPPO share), so we
+                            // must wait until the download stream has been fully
+                            // written before tearing the P2P group down.
+                            // Text sharing never issues an HTTP download, so it is
+                            // excluded from this wait.
+                            transferStartFuture.awaitWithTimeout(
+                                Duration.ofSeconds(30),
+                                "Waiting for start transfer",
+                                R.string.error_send_timeout_handshake
+                            )
+                            try {
+                                transferCompleteFuture.await()
+                            } catch (e: Throwable) {
+                                Log.e(
+                                    TAG,
+                                    "Peer reported success but download stream failed",
+                                    e
+                                )
+                                throw e
+                            }
+                        }
                         delay(1000)
                         transferJob.cancel()
                         return@coroutineScope
@@ -572,15 +681,20 @@ class P2pSenderService : BaseP2pService() {
                 wifiLock = null
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 MyApplication.getInstance().clearBusy()
+                sendBroadcast(
+                    Intent(ACTION_SEND_FINISHED)
+                        .setPackage(packageName)
+                        .putExtra("taskId", task.id)
+                )
                 synchronized(currentTaskLock) {
-                    curreentTaskId = null
+                    currentTaskId = null
                     currentJob = null
                 }
             }
         }
 
         synchronized(currentTaskLock) {
-            curreentTaskId = task.id
+            currentTaskId = task.id
             currentJob = job
         }
 
@@ -589,7 +703,7 @@ class P2pSenderService : BaseP2pService() {
 
     fun cancel(taskId: Int) {
         synchronized(currentTaskLock) {
-            if (curreentTaskId == taskId) {
+            if (currentTaskId == taskId) {
                 currentJob?.cancel(CancelledByUserException(false))
             }
         }
@@ -627,21 +741,16 @@ class P2pSenderService : BaseP2pService() {
         totalSize: Long,
         processedSize: Long
     ): Notification {
-        val n = createNotificationBuilder(R.drawable.ic_upload_file)
+        // Progress is shown in the share window; the notification only keeps
+        // a simple status line.
+        return createNotificationBuilder(R.drawable.ic_upload_file)
             .setContentTitle(getString(R.string.sending))
             .setSubText(targetName)
+            .setContentText(getString(R.string.noti_waiting))
             .addAction(createCancelSendingAction(taskId))
             .setOnlyAlertOnce(true)
             .setOngoing(true)
-
-        val progress = 100.0 * (processedSize.toDouble() / totalSize.toDouble())
-        n.setProgress(100, progress.toInt(), false)
-
-        val f1 = Formatter.formatShortFileSize(this, processedSize)
-        val f2 = Formatter.formatShortFileSize(this, totalSize)
-        n.setContentText("$f1 / $f2 | ${progress.toInt()}%")
-
-        return n.build()
+            .build()
     }
 
     private fun createFailedNotification(targetName: String, exception: Throwable?): Notification {
@@ -681,6 +790,17 @@ class P2pSenderService : BaseP2pService() {
             .setAutoCancel(true)
             .build()
 
+    private fun isAlreadyCompressed(mimeType: String?): Boolean {
+        if (mimeType == null) return false
+        return mimeType.startsWith("video/") ||
+            mimeType.startsWith("audio/") ||
+            mimeType.startsWith("image/") ||
+            mimeType.contains("zip") ||
+            mimeType.contains("gzip") ||
+            mimeType == "application/pdf" ||
+            mimeType == "application/vnd.android.package-archive"
+    }
+
     @SuppressLint("MissingPermission")
     private fun updateNotification(n: Notification) {
         notificationManager.notify(NotificationUtils.SENDER_FG_ID, n)
@@ -689,7 +809,18 @@ class P2pSenderService : BaseP2pService() {
     companion object {
         private const val ACTION_VERSION_NEGOTIATION = "versionNegotiation"
 
-        private const val ACTION_CANCEL_SENDING = "${BuildConfig.APPLICATION_ID}.CANCEL_SENDING"
+        private val cachedKeyStore: KeyStore by lazy {
+            buildKeyStore {
+                certificate("sampleAlias") {
+                    password = "foobar"
+                    domains = listOf("127.0.0.1", "0.0.0.0", "localhost")
+                }
+            }
+        }
+
+        const val ACTION_CANCEL_SENDING = "${BuildConfig.APPLICATION_ID}.CANCEL_SENDING"
+        const val ACTION_SEND_FINISHED = "${BuildConfig.APPLICATION_ID}.SEND_FINISHED"
+        const val ACTION_SEND_PROGRESS = "${BuildConfig.APPLICATION_ID}.SEND_PROGRESS"
 
         fun getIntent(context: Context, task: TaskInfo): Intent {
             return Intent(context, P2pSenderService::class.java).apply {

@@ -71,4 +71,9 @@
     <string name="select_all">Select All</string>
     <string name="close">Close</string>
     <string name="text_copied">Text copied to clipboard</string>
+    <string name="recv_connecting">Receiving file</string>
+    <string name="recv_connecting_desc">Please keep this screen open while the connection is being established</string>
+    <string name="cancel_receive">Cancel</string>
+    <string name="receive_request_title">Incoming file transfer</string>
+    <string name="noti_receive_request_desc">A device wants to send you files.\nTap this notification to open the receive window, or use the buttons below.</string>
 </resources>

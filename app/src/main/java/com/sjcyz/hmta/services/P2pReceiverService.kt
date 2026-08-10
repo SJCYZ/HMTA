@@ -59,6 +59,7 @@ import com.sjcyz.hmta.AppSettings
 import com.sjcyz.hmta.BuildConfig
 import com.sjcyz.hmta.FakeTrustManager
 import com.sjcyz.hmta.MyApplication
+import com.sjcyz.hmta.ReceiveConfirmActivity
 import com.sjcyz.hmta.R
 import com.sjcyz.hmta.exceptions.CancelledByUserException
 import com.sjcyz.hmta.exceptions.ExceptionWithMessage
@@ -98,6 +99,12 @@ class P2pReceiverService : BaseP2pService() {
                 ACTION_CANCEL_RECEIVING -> {
                     cancel(intent.getIntExtra("taskId", -1))
                 }
+
+                ACTION_CANCEL_RECEIVE_CONFIRM -> {
+                    synchronized(currentTaskLock) {
+                        currentTaskId?.let { cancel(it) }
+                    }
+                }
             }
         }
     }
@@ -117,6 +124,7 @@ class P2pReceiverService : BaseP2pService() {
 
         registerInternalBroadcastReceiver(internalReceiver, IntentFilter().apply {
             addAction(ACTION_CANCEL_RECEIVING)
+            addAction(ACTION_CANCEL_RECEIVE_CONFIRM)
         })
         internalReceiverRegistered = true
     }
@@ -204,12 +212,14 @@ class P2pReceiverService : BaseP2pService() {
                         createFailedNotification(e)
                     )
                 }
-            } finally {
-                try { wifiLock?.release() } catch (_: Throwable) {}
-                wifiLock = null
-                stopForeground(STOP_FOREGROUND_REMOVE)
-                MyApplication.getInstance().clearBusy()
-            }
+                } finally {
+                    try { wifiLock?.release() } catch (_: Throwable) {}
+                    wifiLock = null
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                    MyApplication.getInstance().clearBusy()
+                    notificationManager.cancel(NotificationUtils.RECEIVE_CONFIRM_NOTIFICATION_ID)
+                    sendBroadcast(Intent(ACTION_RECEIVE_FINISHED).setPackage(packageName))
+                }
         }
 
         synchronized(currentTaskLock) {
@@ -265,31 +275,50 @@ class P2pReceiverService : BaseP2pService() {
             resources.getString(R.string.noti_request_desc_text)
         }
 
-        val dismissIntent = PendingIntent.getBroadcast(
+        val dismissIntent = PendingIntent.getActivity(
             this,
             taskId,
-            Intent(ACTION_DISMISSED).apply { putExtra("taskId", taskId) },
-            PendingIntent.FLAG_IMMUTABLE
+            Intent(this, ReceiveConfirmActivity::class.java).apply {
+                putExtra("action", ACTION_REJECT)
+                putExtra("taskId", taskId)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            },
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
-        val acceptIntent = PendingIntent.getBroadcast(
+        val acceptIntent = PendingIntent.getActivity(
             this,
             taskId,
-            Intent(ACTION_ACCEPTED).apply { putExtra("taskId", taskId) },
-            PendingIntent.FLAG_IMMUTABLE
+            Intent(this, ReceiveConfirmActivity::class.java).apply {
+                putExtra("action", ACTION_ACCEPT)
+                putExtra("taskId", taskId)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            },
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
         val n = createNotificationBuilder(R.drawable.ic_downloading).setContentTitle(senderName)
             .setContentText(contentText)
+            .setOnlyAlertOnce(true)
+            .setSilent(true)
             .addAction(R.drawable.ic_done, getString(R.string.accept), acceptIntent)
             .addAction(R.drawable.ic_close, getString(R.string.reject), dismissIntent)
-            .setDeleteIntent(dismissIntent)
+            .setDeleteIntent(
+                PendingIntent.getBroadcast(
+                    this,
+                    taskId,
+                    Intent(ACTION_DISMISSED).apply { putExtra("taskId", taskId) },
+                    PendingIntent.FLAG_IMMUTABLE
+                )
+            )
 
         if (thumbnail != null) {
             n.setStyle(NotificationCompat.BigPictureStyle().bigPicture(thumbnail))
         }
         if (textContent != null) {
             n.setStyle(NotificationCompat.BigTextStyle().bigText(textContent))
+        } else {
+            n.setStyle(NotificationCompat.BigTextStyle().bigText("$fileName\n$contentText"))
         }
 
         return n.build()
@@ -305,26 +334,15 @@ class P2pReceiverService : BaseP2pService() {
             PendingIntent.FLAG_IMMUTABLE
         )
 
-        val n =
-            createNotificationBuilder(R.drawable.ic_downloading).setContentTitle(getString(R.string.receiving))
-                .setSubText(senderName)
-                .addAction(R.drawable.ic_close, getString(android.R.string.cancel), cancelIntent)
-                .setOngoing(true).setOnlyAlertOnce(true)
-        var text = getString(R.string.preparing)
-
-        if (processedSize != null) {
-            val progress = 100.0 * (processedSize.toDouble() / totalSize.toDouble())
-            n.setProgress(100, progress.toInt(), false)
-
-            val f1 = Formatter.formatShortFileSize(this, processedSize)
-            val f2 = Formatter.formatShortFileSize(this, totalSize)
-            text = "$f1 / $f2 | ${progress.toInt()}%"
-        } else {
-            n.setProgress(0, 0, true)
-        }
-        n.setContentText(text)
-
-        return n.build()
+        // Progress is shown in the foreground confirm window; the
+        // notification only keeps a simple status line.
+        return createNotificationBuilder(R.drawable.ic_downloading)
+            .setContentTitle(getString(R.string.receiving))
+            .setSubText(senderName)
+            .setContentText(getString(R.string.noti_waiting))
+            .addAction(R.drawable.ic_close, getString(android.R.string.cancel), cancelIntent)
+            .setOngoing(true).setOnlyAlertOnce(true)
+            .build()
     }
 
     private fun createCompletedNotification(
@@ -401,45 +419,47 @@ class P2pReceiverService : BaseP2pService() {
 
     @SuppressLint("MissingPermission")
     private suspend fun runReceive(p2pInfo: P2pInfo, localTaskId: Int, transferCompleted: java.util.concurrent.atomic.AtomicBoolean) = coroutineScope {
-        val client = HttpClient(OkHttp) {
-            install(WebSockets)
-            engine {
-                config {
-                    val sslContext = SSLContext.getInstance("TLSv1.2")
-                    val tm = FakeTrustManager()
-                    sslContext.init(null, arrayOf(tm), SecureRandom())
-
-                    connectTimeout(3, TimeUnit.SECONDS)
-                    readTimeout(0, TimeUnit.MILLISECONDS)
-                    writeTimeout(0, TimeUnit.MILLISECONDS)
-                    connectionPool(
-                        ConnectionPool(5, 10, TimeUnit.SECONDS)
-                    )
-                    sslSocketFactory(sslContext.socketFactory, tm)
-                    hostnameVerifier { _, _ -> true }
-                }
-            }
-        }
+        val client = sharedHttpClient
 
         val p2pConfig = WifiP2pConfig.Builder()
             .setNetworkName(p2pInfo.ssid)
             .setPassphrase(p2pInfo.psk)
             .build()
 
-        client.use { client ->
-            p2pFuture = CompletableDeferred()
-            val groupInfo = p2pManager.requestGroupInfo(p2pChannel)
-            if (groupInfo != null) {
-                Log.i(TAG, "A P2P group already exists, trying to remove")
-                p2pManager.removeGroupSuspend(p2pChannel)
-            }
-            p2pManager.connectSuspend(p2pChannel, p2pConfig)
-            try {
-                val (wifiP2pInfo, wifiP2pGroup) = p2pFuture.awaitWithTimeout(
-                    Duration.ofSeconds(10), "Waiting for P2P connect", R.string.error_p2p_failed
-                )
+        p2pFuture = CompletableDeferred()
+        val groupInfo = p2pManager.requestGroupInfo(p2pChannel)
+        if (groupInfo != null) {
+            Log.i(TAG, "A P2P group already exists, trying to remove")
+            p2pManager.removeGroupSuspend(p2pChannel)
+        }
+        try {
+                var attempt = 0
+                var wifiP2pInfo: WifiP2pInfo? = null
+                while (attempt < 2 && wifiP2pInfo == null) {
+                    attempt++
+                    try {
+                        p2pFuture = CompletableDeferred()
+                        p2pManager.connectSuspend(p2pChannel, p2pConfig)
+                        wifiP2pInfo = p2pFuture.awaitWithTimeout(
+                            Duration.ofSeconds(15), "Waiting for P2P connect", R.string.error_p2p_failed
+                        ).first
+                    } catch (e: Throwable) {
+                        Log.w(TAG, "P2P connect attempt $attempt failed", e)
+                        try {
+                            p2pManager.removeGroup(p2pChannel, null)
+                        } catch (_: Throwable) {}
+                        try {
+                            p2pManager.cancelConnect(p2pChannel, null)
+                        } catch (_: Throwable) {}
+                        if (attempt < 2) {
+                            delay(2000)
+                        } else {
+                            throw e
+                        }
+                    }
+                }
 
-                val hostPort = "${wifiP2pInfo.groupOwnerAddress.hostAddress}:${p2pInfo.port}"
+                val hostPort = "${wifiP2pInfo!!.groupOwnerAddress.hostAddress}:${p2pInfo.port}"
 
                 val sendRequestFuture = CompletableDeferred<JSONObject>()
                 val statusFuture = CompletableDeferred<Pair<Int, String>>()
@@ -466,7 +486,12 @@ class P2pReceiverService : BaseP2pService() {
                     }
 
                     if (!AppSettings(this@P2pReceiverService).autoAccept) {
-                        updateNotification(
+                        // Reuse the notification that raised the confirm page,
+                        // turning it into the accept/reject question instead of
+                        // posting a second notification. The confirm page itself
+                        // receives the same details via ACTION_RECEIVE_ASK.
+                        notificationManager.notify(
+                            NotificationUtils.RECEIVE_CONFIRM_NOTIFICATION_ID,
                             createAskingNotification(
                                 localTaskId,
                                 senderName,
@@ -476,6 +501,15 @@ class P2pReceiverService : BaseP2pService() {
                                 null,
                                 textContent
                             )
+                        )
+                        sendBroadcast(
+                            Intent(ACTION_RECEIVE_ASK)
+                                .setPackage(packageName)
+                                .putExtra("taskId", localTaskId)
+                                .putExtra("senderName", senderName)
+                                .putExtra("fileName", fileName)
+                                .putExtra("fileCount", fileCount)
+                                .putExtra("totalSize", totalSize)
                         )
 
                         val userResponse = withTimeoutOrNull(10000L) {
@@ -522,6 +556,13 @@ class P2pReceiverService : BaseP2pService() {
                                     total,
                                     processed
                                 )
+                            )
+                            sendBroadcast(
+                                Intent(ACTION_RECEIVE_PROGRESS)
+                                    .setPackage(packageName)
+                                    .putExtra("taskId", localTaskId)
+                                    .putExtra("processed", processed)
+                                    .putExtra("total", total)
                             )
                         }
 
@@ -609,10 +650,9 @@ class P2pReceiverService : BaseP2pService() {
                         break
                     }
                 }
-            } finally {
-                p2pManager.removeGroup(p2pChannel, null)
-                p2pManager.cancelConnect(p2pChannel, null)
-            }
+        } finally {
+            p2pManager.removeGroup(p2pChannel, null)
+            p2pManager.cancelConnect(p2pChannel, null)
         }
     }
 
@@ -739,14 +779,42 @@ class P2pReceiverService : BaseP2pService() {
     }
 
     companion object {
+        private val sharedHttpClient: HttpClient by lazy {
+            HttpClient(OkHttp) {
+                install(WebSockets)
+                engine {
+                    config {
+                        val sslContext = SSLContext.getInstance("TLSv1.2")
+                        val tm = FakeTrustManager()
+                        sslContext.init(null, arrayOf(tm), SecureRandom())
+
+                        connectTimeout(3, TimeUnit.SECONDS)
+                        readTimeout(0, TimeUnit.MILLISECONDS)
+                        writeTimeout(0, TimeUnit.MILLISECONDS)
+                        connectionPool(
+                            ConnectionPool(5, 10, TimeUnit.SECONDS)
+                        )
+                        sslSocketFactory(sslContext.socketFactory, tm)
+                        hostnameVerifier { _, _ -> true }
+                    }
+                }
+            }
+        }
+
+        const val ACTION_RECEIVE_FINISHED = "${BuildConfig.APPLICATION_ID}.RECEIVE_FINISHED"
+        const val ACTION_CANCEL_RECEIVE_CONFIRM = "${BuildConfig.APPLICATION_ID}.CANCEL_RECEIVE_CONFIRM"
+        const val ACTION_RECEIVE_ASK = "${BuildConfig.APPLICATION_ID}.RECEIVE_ASK"
+        const val ACTION_RECEIVE_PROGRESS = "${BuildConfig.APPLICATION_ID}.RECEIVE_PROGRESS"
+        const val ACTION_ACCEPT = "${BuildConfig.APPLICATION_ID}.ACCEPT"
+        const val ACTION_REJECT = "${BuildConfig.APPLICATION_ID}.REJECT"
+        const val ACTION_DISMISSED = "${BuildConfig.APPLICATION_ID}.NOTIFICATION_DISMISSED"
+        const val ACTION_ACCEPTED = "${BuildConfig.APPLICATION_ID}.NOTIFICATION_ACCEPTED"
+        const val ACTION_CANCEL_RECEIVING = "${BuildConfig.APPLICATION_ID}.CANCEL_RECEIVING"
+
         fun getIntent(context: Context, p2pInfo: P2pInfo): Intent {
             return Intent(context, P2pReceiverService::class.java).apply {
                 putExtra("p2p_info", p2pInfo)
             }
         }
-
-        private val ACTION_DISMISSED = "${BuildConfig.APPLICATION_ID}.NOTIFICATION_DISMISSED"
-        private val ACTION_ACCEPTED = "${BuildConfig.APPLICATION_ID}.NOTIFICATION_ACCEPTED"
-        private val ACTION_CANCEL_RECEIVING = "${BuildConfig.APPLICATION_ID}.CANCEL_RECEIVING"
     }
 }

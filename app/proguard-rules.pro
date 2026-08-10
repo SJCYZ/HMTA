@@ -24,10 +24,24 @@
 
 -keepattributes LineNumberTable,SourceFile
 -renamesourcefileattribute SourceFile
--keepattributes Signature,InnerClasses
+-keepattributes Signature,InnerClasses,Exceptions,AnnotationDefault
 
--keep class com.sjcyz.hmta.** { *; }
+# kotlinx.serialization: keep generated serializers reachable via reflection
+-keepclasseswithmembers class com.sjcyz.hmta.** {
+    kotlinx.serialization.KSerializer serializer(...);
+}
+-keepclassmembers class com.sjcyz.hmta.** {
+    *** Companion;
+}
 
+# Parcelable implementations (parcelize)
+-keep class com.sjcyz.hmta.** implements android.os.Parcelable { *; }
+
+# AIDL service interface
+-keep class com.sjcyz.hmta.IMacAddressService { *; }
+-keep class com.sjcyz.hmta.IMacAddressService$Stub { *; }
+
+# Ktor/Netty/Coroutines rely heavily on reflection; keep as-is.
 -keep class io.netty.** { *; }
 -keep class io.ktor.** { *; }
 -keep class kotlinx.coroutines.** { *; }

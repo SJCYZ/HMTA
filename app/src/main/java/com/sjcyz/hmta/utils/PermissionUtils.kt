@@ -61,9 +61,29 @@ fun Context.checkP2pPermissions(): Boolean {
 }
 
 fun Context.registerInternalBroadcastReceiver(receiver: BroadcastReceiver, filter: IntentFilter) {
-    registerReceiver(receiver, filter, INTERNAL_BROADCAST_PERMISSION, null, getReceiverFlags())
+    registerReceiver(
+        receiver,
+        filter,
+        INTERNAL_BROADCAST_PERMISSION,
+        null,
+        getInternalReceiverFlags()
+    )
 }
 
+/**
+ * App-internal broadcasts only; never used for system broadcasts.
+ */
+fun getInternalReceiverFlags(): Int {
+    return if (Build.VERSION.SDK_INT >= 33) {
+        Context.RECEIVER_NOT_EXPORTED
+    } else {
+        0
+    }
+}
+
+/**
+ * System broadcasts (e.g. WifiP2pManager actions) still need EXPORTED.
+ */
 fun getReceiverFlags(): Int {
     return if (Build.VERSION.SDK_INT >= 33) {
         Context.RECEIVER_EXPORTED

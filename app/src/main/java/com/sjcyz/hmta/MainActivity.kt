@@ -16,6 +16,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContract
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.result.launch
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -61,6 +62,20 @@ import rikka.shizuku.Shizuku
 import java.util.ArrayList
 
 class MainActivity : ComponentActivity() {
+    private val permissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { grants ->
+        val denied = grants.filterValues { !it }
+        if (denied.isNotEmpty()) {
+            Toast.makeText(
+                this,
+                "${denied.keys.first()} not granted",
+                Toast.LENGTH_LONG
+            ).show()
+            finish()
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -114,22 +129,7 @@ class MainActivity : ComponentActivity() {
         }
 
         if (permissionsToRequest.isNotEmpty()) {
-            requestPermissions(permissionsToRequest.toTypedArray(), 0)
-        }
-    }
-
-    override fun onRequestPermissionsResult(
-        requestCode: Int, permissions: Array<out String>, grantResults: IntArray, deviceId: Int
-    ) {
-        for ((name, status) in permissions.zip(grantResults.toList())) {
-            if (status == PackageManager.PERMISSION_GRANTED) {
-                continue
-            }
-
-            Toast.makeText(this, "$name not granted", Toast.LENGTH_LONG).show()
-            finish()
-
-            return
+            permissionLauncher.launch(permissionsToRequest.toTypedArray())
         }
     }
 }
@@ -202,7 +202,9 @@ fun MainActivityContent() {
     val pickFilesLauncher = rememberLauncherForActivityResult(ChooseFilesContract()) { pickedUris ->
         if (pickedUris.isNotEmpty()) {
             val intent = Intent(context, ShareActivity::class.java)
+                .setAction(Intent.ACTION_SEND_MULTIPLE)
                 .putParcelableArrayListExtra(Intent.EXTRA_STREAM, ArrayList(pickedUris))
+                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             context.startActivity(intent)
         }
     }
