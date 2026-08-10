@@ -23,6 +23,7 @@ import android.os.Environment
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.provider.DocumentsContract
 import android.provider.MediaStore
 import android.text.format.Formatter
 import android.util.Log
@@ -371,12 +372,7 @@ class P2pReceiverService : BaseP2pService() {
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             }
         } else {
-            Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
-                putExtra(
-                    "android.provider.extra.INITIAL_URI",
-                    "content://downloads/public_downloads".toUri()
-                )
-            }
+            openReceiveFolderIntent()
         }
         builder.setContentIntent(
             PendingIntent.getActivity(
@@ -384,6 +380,71 @@ class P2pReceiverService : BaseP2pService() {
             )
         )
         return builder.build()
+    }
+
+    /**
+     * Opens Download/HMTA in the Huawei File Manager via its supported
+     * explicit component (StorageActivity reads the `curr_dir` extra to
+     * jump to the target folder). Falls back to the document URI / the
+     * system document picker on non-Huawei devices.
+     */
+    private fun openReceiveFolderIntent(): Intent {
+        val folderPath = "${Environment.getExternalStorageDirectory().path}/${
+            Environment.DIRECTORY_DOWNLOADS
+        }/HMTA"
+
+        // Huawei / HarmonyOS (4.x) file manager route. The explicit component
+        // avoids third-party apps (e.g. Baidu Netdisk) that register
+        // resource/folder from hijacking the tap. StorageActivity accepts the
+        // curr_dir extra and opens the target folder directly.
+        val hwIntent = Intent(Intent.ACTION_VIEW).apply {
+            setClassName(
+                "com.huawei.filemanager",
+                "com.huawei.hidisk.view.activity.category.StorageActivity"
+            )
+            setType("filemanager.dir/*")
+            putExtra("curr_dir", folderPath)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        if (hwIntent.resolveActivity(packageManager) != null) {
+            return hwIntent
+        }
+        // On API 30+ resolveActivity can return null for packages hidden by
+        // the visibility filter; check the package directly as a fallback so
+        // the Huawei route still wins on Huawei ROMs.
+        if (isPackageInstalled("com.huawei.filemanager") ||
+            isPackageInstalled("com.huawei.hidisk")
+        ) {
+            return hwIntent
+        }
+
+        val folderUri = DocumentsContract.buildDocumentUri(
+            "com.android.externalstorage.documents",
+            "primary:${Environment.DIRECTORY_DOWNLOADS}/HMTA"
+        )
+        val openFolderIntent = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(folderUri, "resource/folder")
+            addFlags(
+                Intent.FLAG_ACTIVITY_NEW_TASK or
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION
+            )
+        }
+        if (openFolderIntent.resolveActivity(packageManager) != null) {
+            return openFolderIntent
+        }
+
+        return Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
+            putExtra(
+                "android.provider.extra.INITIAL_URI",
+                "content://downloads/public_downloads".toUri()
+            )
+        }
+    }
+
+    private fun isPackageInstalled(packageName: String): Boolean = try {
+        packageManager.getPackageInfo(packageName, 0) != null
+    } catch (e: Exception) {
+        false
     }
 
     private fun createFailedNotification(exception: Throwable?): Notification {
