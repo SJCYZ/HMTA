@@ -100,6 +100,13 @@ object ShizukuUtils {
         return suspendGetMacAddress(context, name)
     }
 
+    suspend fun execCommand(command: String): String? {
+        val service = awaitService() ?: return null
+        return runCatching { service.execCommand(command) }
+            .onFailure { Log.e(TAG, "Shizuku command failed", it) }
+            .getOrNull()
+    }
+
     private suspend fun suspendGetMacAddress(context: Context, name: String): String? {
         if (context.checkSelfPermission("android.permission.LOCAL_MAC_ADDRESS") == PackageManager.PERMISSION_GRANTED) {
             Log.d(TAG, "Permission granted, using native method")
@@ -117,10 +124,21 @@ object ShizukuUtils {
             return null
         }
 
-        val deferred = serviceDeferred
-        val svc = withTimeoutOrNull(20_000) {
-            deferred.await()
-        }
+        val svc = awaitService()
         return svc?.getMacAddressByName(name)
+    }
+
+    private suspend fun awaitService(): IMacAddressService? {
+        synchronized(binderLock) {
+            macService?.let { return it }
+        }
+        try {
+            unsafeBindService()
+        } catch (e: Throwable) {
+            Log.e(TAG, "Failed to bind Shizuku service", e)
+            return null
+        }
+        val deferred = synchronized(binderLock) { serviceDeferred }
+        return withTimeoutOrNull(20_000) { deferred.await() }
     }
 }

@@ -62,6 +62,7 @@ class SettingsActivity : ComponentActivity() {
 fun SettingsActivityContent() {
     val activity = LocalActivity.current
     val context = LocalContext.current
+    val logCaptureFailedMessage = stringResource(R.string.log_capture_failed)
     val settings = remember(activity) { AppSettings(context) }
 
     var deviceNameValue by remember {
@@ -76,6 +77,10 @@ fun SettingsActivityContent() {
         mutableStateOf(settings.autoAccept)
     }
 
+    var nfcTransferEnabled by remember {
+        mutableStateOf(settings.nfcTransferEnabled)
+    }
+
     Scaffold(topBar = {
         TopAppBar(
             title = { Text(text = stringResource(R.string.title_activity_settings)) },
@@ -86,6 +91,8 @@ fun SettingsActivityContent() {
                         settings.deviceName = nameValue
                     }
                     settings.verbose = verboseValue
+                    settings.autoAccept = autoAcceptValue
+                    settings.nfcTransferEnabled = nfcTransferEnabled
 
                     activity?.finish()
                 }) {
@@ -150,6 +157,26 @@ fun SettingsActivityContent() {
                 }
             }
             item {
+                DefaultCard {
+                    Row(
+                        modifier = Modifier.padding(16.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = stringResource(R.string.nfc_transfer_name),
+                                style = MaterialTheme.typography.titleMedium,
+                            )
+                            Text(text = stringResource(R.string.nfc_transfer_desc))
+                        }
+                        Switch(
+                            checked = nfcTransferEnabled,
+                            onCheckedChange = { nfcTransferEnabled = it },
+                        )
+                    }
+                }
+            }
+            item {
                 DefaultCard(onClick = {
                     Thread {
                         try {
@@ -181,7 +208,7 @@ fun SettingsActivityContent() {
                             Handler(Looper.getMainLooper()).post {
                                 Toast.makeText(
                                     context,
-                                    context.getString(R.string.log_capture_failed),
+                                    logCaptureFailedMessage,
                                     Toast.LENGTH_LONG
                                 ).show()
                             }

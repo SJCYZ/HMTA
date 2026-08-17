@@ -9,7 +9,8 @@
 - [x] 双向大文件传输（5GHz Wi-Fi Direct + Wi-Fi 高性能锁）
 - [x] 悬浮窗设备选择
 - [x] 文本传输（复制至剪贴板）
-- [ ] NFC 一碰传
+- [ ] NFC 一碰传（协议与实现已在 NFCProbe 实机验证，移植方案见
+  [docs/NFC-OPPO互传-完整移植文档.md](docs/NFC-OPPO互传-完整移植文档.md)）
 
 ## 架构
 

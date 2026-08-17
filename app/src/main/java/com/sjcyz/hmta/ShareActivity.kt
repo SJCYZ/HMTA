@@ -24,6 +24,7 @@ import android.text.format.Formatter
 import android.util.Log
 import android.widget.Toast
 import androidx.core.content.FileProvider
+import androidx.core.content.ContextCompat
 import com.sjcyz.hmta.BuildConfig
 import java.io.File
 import androidx.activity.ComponentActivity
@@ -75,6 +76,8 @@ import com.sjcyz.hmta.models.DiscoveredDevice
 import com.sjcyz.hmta.models.FileInfo
 import com.sjcyz.hmta.models.TaskInfo
 import com.sjcyz.hmta.services.P2pSenderService
+import com.sjcyz.hmta.services.NfcSendService
+import com.sjcyz.hmta.nfc.NfcForegroundDispatch
 import com.sjcyz.hmta.ui.DefaultCard
 import com.sjcyz.hmta.ui.theme.HmtaTheme
 import com.sjcyz.hmta.utils.BleUtils
@@ -89,14 +92,17 @@ private data class SendingState(
     val taskId: Int,
     val deviceName: String,
     val progress: Pair<Long, Long>? = null,
+    val isNfc: Boolean = false,
 )
 
 class ShareActivity : ComponentActivity() {
     private lateinit var bluetoothManager: BluetoothManager
     private val fileInfosState = mutableStateOf<List<FileInfo>?>(null)
+    private lateinit var nfcForegroundDispatch: NfcForegroundDispatch
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        nfcForegroundDispatch = NfcForegroundDispatch(this)
 
         bluetoothManager = getSystemService(BluetoothManager::class.java)
         val adapter = bluetoothManager.adapter
@@ -141,6 +147,13 @@ class ShareActivity : ComponentActivity() {
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
+        if (intent.action == android.nfc.NfcAdapter.ACTION_NDEF_DISCOVERED ||
+            intent.action == android.nfc.NfcAdapter.ACTION_TAG_DISCOVERED ||
+            intent.action == android.nfc.NfcAdapter.ACTION_TECH_DISCOVERED
+        ) {
+            Log.i(TAG, "发送期间拦截本机 NFC 读卡事件")
+            return
+        }
         setIntent(intent)
         val fileInfos = resolveFileInfos(intent)
         if (fileInfos == null) {
@@ -149,6 +162,16 @@ class ShareActivity : ComponentActivity() {
         }
         fileInfosState.value = fileInfos
         Log.i(TAG, "New share request: ${fileInfos.size} files")
+    }
+
+    override fun onResume() {
+        super.onResume()
+        nfcForegroundDispatch.enable()
+    }
+
+    override fun onPause() {
+        nfcForegroundDispatch.disable()
+        super.onPause()
     }
 
     private fun resolveFileInfos(intent: Intent): List<FileInfo>? {
@@ -261,6 +284,7 @@ fun ShareActivityContent(files: List<FileInfo>) {
     val activity = LocalActivity.current
     val discoveredDevices = deviceScanner()
     var sending by remember { mutableStateOf<SendingState?>(null) }
+    val nfcTransferEnabled = remember { AppSettings(context).nfcTransferEnabled }
 
     // Keep this page (and therefore the share URI grant) alive until the
     // transfer finishes; some providers revoke the temporary grant as soon
@@ -276,6 +300,11 @@ fun ShareActivityContent(files: List<FileInfo>) {
                         }
                     }
 
+                    NfcSendService.ACTION_SEND_FINISHED -> {
+                        val taskId = intent.getIntExtra("taskId", -1)
+                        if (sending?.taskId == taskId) activity?.finish()
+                    }
+
                     P2pSenderService.ACTION_SEND_PROGRESS -> {
                         val taskId = intent.getIntExtra("taskId", -1)
                         val current = sending
@@ -288,18 +317,34 @@ fun ShareActivityContent(files: List<FileInfo>) {
                             )
                         }
                     }
+
+                    NfcSendService.ACTION_SEND_PROGRESS -> {
+                        val taskId = intent.getIntExtra("taskId", -1)
+                        val current = sending
+                        if (current?.taskId == taskId) {
+                            sending = current.copy(
+                                progress = Pair(
+                                    intent.getLongExtra("processed", 0L),
+                                    intent.getLongExtra("total", 0L),
+                                ),
+                            )
+                        }
+                    }
                 }
             }
         }
         val filter = IntentFilter().apply {
             addAction(P2pSenderService.ACTION_SEND_FINISHED)
             addAction(P2pSenderService.ACTION_SEND_PROGRESS)
+            addAction(NfcSendService.ACTION_SEND_FINISHED)
+            addAction(NfcSendService.ACTION_SEND_PROGRESS)
         }
-        if (Build.VERSION.SDK_INT >= 33) {
-            context.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
-        } else {
-            @Suppress("DEPRECATION") context.registerReceiver(receiver, filter)
-        }
+        ContextCompat.registerReceiver(
+            context,
+            receiver,
+            filter,
+            ContextCompat.RECEIVER_NOT_EXPORTED,
+        )
         onDispose {
             context.unregisterReceiver(receiver)
         }
@@ -342,6 +387,30 @@ fun ShareActivityContent(files: List<FileInfo>) {
                         contentPadding = PaddingValues(horizontal = 16.dp),
                         modifier = Modifier.weight(1f)
                     ) {
+                        if (nfcTransferEnabled) {
+                            item(key = "nfc-oppo") {
+                                DefaultCard(onClick = {
+                                    val nfcTaskId = Random.nextInt()
+                                    NfcSendService.start(context, nfcTaskId, files)
+                                    sending = SendingState(
+                                        taskId = nfcTaskId,
+                                        deviceName = "NFC 一碰传（OPPO）",
+                                        isNfc = true,
+                                    )
+                                }) {
+                                    Row(
+                                        modifier = Modifier.padding(16.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                    ) {
+                                        Icon(Icons.Filled.AccountCircle, null, modifier = iconMod)
+                                        Column {
+                                            Text("NFC 一碰传（OPPO）", style = MaterialTheme.typography.titleMedium)
+                                            Text("选择后将两台手机的 NFC 区域贴近")
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         if (discoveredDevices.isEmpty()) {
                             item { Text(stringResource(R.string.scanning_desc)) }
                         } else {
@@ -409,10 +478,14 @@ fun ShareActivityContent(files: List<FileInfo>) {
                         }
                         Spacer(modifier = Modifier.height(24.dp))
                         Button(onClick = {
-                            context.sendBroadcast(
-                                Intent(P2pSenderService.ACTION_CANCEL_SENDING)
-                                    .putExtra("taskId", currentSending.taskId)
-                            )
+                            if (currentSending.isNfc) {
+                                NfcSendService.cancel(context)
+                            } else {
+                                context.sendBroadcast(
+                                    Intent(P2pSenderService.ACTION_CANCEL_SENDING)
+                                        .putExtra("taskId", currentSending.taskId)
+                                )
+                            }
                             activity?.finish()
                         }) {
                             Text(text = stringResource(R.string.cancel_receive))
