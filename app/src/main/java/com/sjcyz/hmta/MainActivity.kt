@@ -20,6 +20,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.result.launch
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -33,6 +34,7 @@ import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
@@ -52,7 +54,12 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.res.vectorResource
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.sjcyz.hmta.services.GattServerService
+import com.sjcyz.hmta.services.NfcReceiveService
+import com.sjcyz.hmta.nfc.NfcForegroundDispatch
+import com.sjcyz.hmta.nfc.NfcTransferCoordinator
+import com.sjcyz.hmta.nfc.NfcTransferPhase
 import com.sjcyz.hmta.ui.DefaultCard
 import com.sjcyz.hmta.ui.theme.HmtaTheme
 import com.sjcyz.hmta.utils.ServiceState
@@ -62,6 +69,8 @@ import rikka.shizuku.Shizuku
 import java.util.ArrayList
 
 class MainActivity : ComponentActivity() {
+    private lateinit var nfcForegroundDispatch: NfcForegroundDispatch
+
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { grants ->
@@ -79,6 +88,8 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        nfcForegroundDispatch = NfcForegroundDispatch(this)
+
         checkAndRequestPermissions()
 
         enableEdgeToEdge()
@@ -87,6 +98,32 @@ class MainActivity : ComponentActivity() {
                 MainActivityContent()
             }
         }
+        handleNfcIntent(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleNfcIntent(intent)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        nfcForegroundDispatch.enable()
+    }
+
+    override fun onPause() {
+        nfcForegroundDispatch.disable()
+        super.onPause()
+    }
+
+    private fun handleNfcIntent(intent: Intent?) {
+        if (!AppSettings(this).nfcTransferEnabled) return
+        val invitation = nfcForegroundDispatch.invitationFrom(intent) ?: return
+        val generation = NfcTransferCoordinator.startReceive(invitation)
+        NfcReceiveService.start(this, invitation, generation)
+        Log.i(TAG, "OPPO NFC invitation: deviceId=${invitation.deviceId}")
+        Toast.makeText(this, "已识别 OPPO NFC，正在准备连接", Toast.LENGTH_SHORT).show()
     }
 
     private fun checkAndRequestPermissions() {
@@ -141,6 +178,7 @@ fun MainActivityContent() {
     val listState = rememberLazyListState()
 
     val context = LocalContext.current
+    val nfcState by NfcTransferCoordinator.state.collectAsStateWithLifecycle()
     DisposableEffect(context) {
         val receiver = object : BroadcastReceiver() {
             override fun onReceive(context: Context, intent: Intent) {
@@ -227,6 +265,26 @@ fun MainActivityContent() {
             verticalArrangement = Arrangement.spacedBy(8.dp),
             contentPadding = PaddingValues(horizontal = 16.dp),
         ) {
+            if (nfcState.phase != NfcTransferPhase.IDLE) {
+                item(key = "nfc-transfer-state") {
+                    DefaultCard {
+                        Column(modifier = Modifier.padding(16.dp)) {
+                            Text("NFC 一碰传", style = MaterialTheme.typography.titleMedium)
+                            Text(nfcState.message)
+                            if (nfcState.totalBytes > 0) {
+                                Spacer(modifier = Modifier.size(8.dp))
+                                LinearProgressIndicator(
+                                    progress = {
+                                        (nfcState.transferredBytes.toFloat() / nfcState.totalBytes)
+                                            .coerceIn(0f, 1f)
+                                    },
+                                    modifier = Modifier.fillMaxWidth(),
+                                )
+                            }
+                        }
+                    }
+                }
+            }
             item {
                 DefaultCard(onClick = {
                     pickFilesLauncher.launch()

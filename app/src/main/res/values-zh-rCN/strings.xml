@@ -73,4 +73,6 @@
     <string name="cancel_receive">取消</string>
     <string name="receive_request_title">收到文件传输请求</string>
     <string name="noti_receive_request_desc">有设备想向您发送文件。\n点击此通知打开接收窗口，或使用下方按钮处理。</string>
+    <string name="nfc_transfer_name">NFC 一碰传（OPPO）</string>
+    <string name="nfc_transfer_desc">启用实验性 NFC 互传链路，需要 Shizuku 授权。</string>
 </resources>

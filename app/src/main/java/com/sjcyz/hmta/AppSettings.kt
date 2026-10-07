@@ -27,4 +27,10 @@ class AppSettings(private val context: Context) {
         set(value) {
             prefs.edit { putBoolean("autoAccept", value) }
         }
+
+    var nfcTransferEnabled: Boolean
+        get() = prefs.getBoolean("nfcTransferEnabled", BuildConfig.DEBUG)
+        set(value) {
+            prefs.edit { putBoolean("nfcTransferEnabled", value) }
+        }
 }

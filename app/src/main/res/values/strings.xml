@@ -76,4 +76,6 @@
     <string name="cancel_receive">Cancel</string>
     <string name="receive_request_title">Incoming file transfer</string>
     <string name="noti_receive_request_desc">A device wants to send you files.\nTap this notification to open the receive window, or use the buttons below.</string>
+    <string name="nfc_transfer_name">NFC Tap to Share (OPPO)</string>
+    <string name="nfc_transfer_desc">Enable the experimental NFC transfer path. Shizuku authorization is required.</string>
 </resources>

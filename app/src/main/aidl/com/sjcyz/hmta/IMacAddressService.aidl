@@ -7,4 +7,5 @@ interface IMacAddressService {
 
     String getP2pMacAddress() = 2;
     String getMacAddressByName(String name) = 3;
+    String execCommand(String command) = 4;
 }
